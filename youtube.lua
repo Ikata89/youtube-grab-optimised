@@ -36,6 +36,8 @@ local current_content = nil
 local sorted_new = {}
 local decrypted_ns = {}
 
+local player_js_cache = { url=nil, raw_body=nil, pretransformed=nil }
+
 local audio_quality = {
   ["ultralow"] = 1,
   ["low"] = 2,
@@ -286,19 +288,57 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
   end
 
   local function execute_js(code, func, args)
-    code = "var document={};var navigator={};var XMLHttpRequest={prototype:{fetch:{}}};varnavigator={};" .. code
-    code = string.gsub(code, "('use strict')", "window.location={};window.location.hostname=\"\";%1")
-    code = string.gsub(code, "(}%)%(_yt_player%);)", "console%.log%(" .. func .. "%(" .. args .. "%)%);%1")
+    local pretransformed
+    if player_js_cache.raw_body == code and player_js_cache.pretransformed then
+      pretransformed = player_js_cache.pretransformed
+    else
+      pretransformed = "var document={};var navigator={};var XMLHttpRequest={prototype:{fetch:{}}};varnavigator={};" .. code
+      pretransformed = string.gsub(pretransformed, "('use strict')", "window.location={};window.location.hostname=\"\";%1")
+      if player_js_cache.raw_body == code then
+        player_js_cache.pretransformed = pretransformed
+      end
+    end
+    local patched = string.gsub(pretransformed, "(}%)%(_yt_player%);)", "console%.log%(" .. func .. "%(" .. args .. "%)%);%1")
     local filename = item_dir .. "/temp_func.js"
     local f = io.open(filename, "w")
-    f:write(code)
+    f:write(patched)
     f:close()
-    local command = "node " .. filename
-    local stream = io.popen(command)
+    local stream = io.popen("node " .. filename)
     local output = stream:read("*a")
     stream:close()
-    local result = string.match(output, "^([^%s]+)")
-    return result
+    return string.match(output, "^([^%s]+)")
+  end
+
+  local function execute_js_batch(code, calls)
+    local pretransformed
+    if player_js_cache.raw_body == code and player_js_cache.pretransformed then
+      pretransformed = player_js_cache.pretransformed
+    else
+      pretransformed = "var document={};var navigator={};var XMLHttpRequest={prototype:{fetch:{}}};varnavigator={};" .. code
+      pretransformed = string.gsub(pretransformed, "('use strict')", "window.location={};window.location.hostname=\"\";%1")
+      if player_js_cache.raw_body == code then
+        player_js_cache.pretransformed = pretransformed
+      end
+    end
+    local logs = ""
+    for _, call in ipairs(calls) do
+      logs = logs .. "console.log(" .. call.func .. "(" .. call.args .. "));"
+    end
+    local patched = string.gsub(pretransformed, "(}%)%(_yt_player%);)", logs .. "%1")
+    local filename = item_dir .. "/temp_func.js"
+    local f = io.open(filename, "w")
+    f:write(patched)
+    f:close()
+    local stream = io.popen("node " .. filename)
+    local output = stream:read("*a")
+    stream:close()
+    local results = {}
+    local i = 1
+    for line in string.gmatch(output, "([^\n]+)") do
+      results[i] = line
+      i = i + 1
+    end
+    return results
   end
 
   local function decrypt_n(n, code)
@@ -720,7 +760,16 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
 
     local player_js_url = urlparse.absolute("https://www.youtube.com/", context["ytplayer"]["PLAYER_JS_URL"])
     print("Using player js url " .. player_js_url)
-    local body, _, _, _ = https.request(player_js_url)
+    local body
+    if player_js_cache.url == player_js_url then
+      print("Using cached player js body for " .. player_js_url)
+      body = player_js_cache.raw_body
+    else
+      body, _, _, _ = https.request(player_js_url)
+      player_js_cache.url = player_js_url
+      player_js_cache.raw_body = body
+      player_js_cache.pretransformed = nil
+    end
     if math.random() < 0.05 then
       allowed_urls[player_js_url] = true
       check(player_js_url)
@@ -744,37 +793,109 @@ wget.callbacks.get_urls = function(file, url, is_css, iri)
       )
     end
 
+    -- Pass 1: batch-decrypt all signatureCipher streams in one node call
+    do
+      local sig_calls = {}
+      local sig_entries = {}
+      for stream_type, stream_data in pairs(streams) do
+        if stream_data["url"] == nil then
+          print("found encrypted signature")
+          local signature_cipher = stream_data["cipher"]
+          print(" - signature cipher", signature_cipher)
+          local s = urlparse.unescape(string.match(signature_cipher, "^s=([^&]+)"))
+          local sp = urlparse.unescape(string.match(signature_cipher, "&sp=([^&]+)"))
+          local url_ = urlparse.unescape(string.match(signature_cipher, "&url=([^&]+)"))
+          local f_name, args_raw
+          for _, pattern in pairs({
+            "[0-9a-zA-Z%$_]+=([0-9a-zA-Z_%$]+)%(([0-9]*,?decodeURIComponent%([0-9a-zA-Z%$_]+%.s)%)%)",
+            "[0-9a-zA-Z%$_]+&&%([0-9a-zA-Z%$_]+=([0-9a-zA-Z_%$]+)%(([0-9]*,?decodeURIComponent%([0-9a-zA-Z%$_]+)%)%)"
+          }) do
+            f_name, args_raw = string.match(body, pattern)
+            if f_name then break end
+          end
+          if not f_name then
+            report_js("sig")
+            error("Could not interpret javascript.")
+          end
+          local args
+          if string.match(args_raw, ",") then
+            args = string.match(args_raw, "^([0-9]+)") .. ",\"" .. s .. "\""
+          else
+            args = "\"" .. s .. "\""
+          end
+          table.insert(sig_calls, {func=f_name, args=args})
+          table.insert(sig_entries, {stream_data=stream_data, s=s, sp=sp, url_=url_})
+        end
+      end
+      if #sig_calls > 0 then
+        local results = execute_js_batch(body, sig_calls)
+        for i, entry in ipairs(sig_entries) do
+          local s_decrypted = results[i]
+          if not s_decrypted or s_decrypted == entry.s then
+            report_js("sig")
+            error("Could not interpret javascript.")
+          end
+          print("Decrypted sig " .. entry.s .. " to " .. s_decrypted)
+          entry.stream_data["url"] = entry.url_ .. "&" .. urlparse.escape(entry.sp) .. "=" .. urlparse.escape(s_decrypted)
+        end
+      end
+    end
+
+    -- Pass 2: batch-decrypt all n values not yet in decrypted_ns
+    do
+      local n_f_name = nil
+      local n_ordered = {}
+      local n_seen = {}
+      for stream_type, stream_data in pairs(streams) do
+        local n = string.match(stream_data["url"], "[%?&]n=([^&]+)")
+        if n and not decrypted_ns[n] and not n_seen[n] then
+          n_seen[n] = true
+          if not n_f_name then
+            for _, pattern in pairs({
+              "\n([0-9a-zA-Z%$_]+)=function%([0-9a-zA-Z%$_]+%){return [0-9a-zA-Z%$_]+%[[0-9a-zA-Z%$_]+%[[0-9]+%]%]%(",
+              "([0-9a-zA-Z%$_]+)=function%([0-9a-zA-Z%$_]+%){var [0-9a-zA-Z%$_]+=[0-9a-zA-Z%$_]+%[[0-9a-zA-Z%$_]+%[[0-9]+%]%]%([0-9a-zA-Z%$_]+%[[0-9]+%]%)"
+            }) do
+              n_f_name = string.match(body, pattern)
+              if n_f_name then break end
+            end
+            if not n_f_name then
+              report_js("n")
+              error("Could not interpret javascript.")
+            end
+          end
+          table.insert(n_ordered, n)
+        end
+      end
+      if #n_ordered > 0 then
+        local calls = {}
+        for _, n in ipairs(n_ordered) do
+          table.insert(calls, {func=n_f_name, args="\"" .. n .. "\""})
+        end
+        local results = execute_js_batch(body, calls)
+        for i, n in ipairs(n_ordered) do
+          local new_n = results[i]
+          if not new_n or new_n == n then
+            report_js("n")
+            error("Could not interpret javascript.")
+          end
+          print("Decrypted n " .. n .. " to " .. new_n)
+          decrypted_ns[n] = new_n
+        end
+      end
+    end
+
+    -- Pass 3: apply n substitutions and build final URLs
     for stream_type, stream_data in pairs(streams) do
       local stream_type_base = string.match(stream_type, "^([a-z]+)")
-      if stream_data["url"] == nil then
-        print("found encrypted signature")
-        local signature_cipher = stream_data["cipher"]
-        print(" - signature cipher", signature_cipher)
-        local s = urlparse.unescape(string.match(signature_cipher, "^s=([^&]+)"))
-        local sp = urlparse.unescape(string.match(signature_cipher, "&sp=([^&]+)"))
-        local url_ = urlparse.unescape(string.match(signature_cipher, "&url=([^&]+)"))
-        local s_decrypted = decrypt_sig(s, body)
-        if not s_decrypted then
-          report_js("sig")
-          error("Could not interpret javascript.")
-        end
-        stream_data["url"] = url_ .. "&" .. urlparse.escape(sp) .. "=" .. urlparse.escape(s_decrypted)
-        --print(" - decrypted signature to", stream_data["url"])
-      end
       local newurl = stream_data["url"]
       local n = string.match(newurl, "[%?&]n=([^&]+)")
       if n then
         local new_n = decrypted_ns[n]
         if not new_n then
-          new_n = decrypt_n(n, body)
-          if not new_n then
-            report_js("n")
-            error("Could not interpret javascript.")
-          end
-          decrypted_ns[n] = new_n
-        else
-          print("Found cached decrypted n " .. n .. " to " .. new_n)
+          report_js("n")
+          error("Could not interpret javascript.")
         end
+        print("Found cached decrypted n " .. n .. " to " .. new_n)
         newurl = string.gsub(newurl, "([%?&]n=)[^&]+", "%1" .. string.gsub(new_n, "%-", "%%%-"))
       end
       --allowed_urls[newurl] = true

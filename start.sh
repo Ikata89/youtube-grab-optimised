@@ -21,4 +21,4 @@ trap cleanup EXIT INT TERM
 # Run the pipeline, forwarding all container args (e.g. --concurrent 6 Ikata)
 # to run-pipeline3. Tee output so both "docker logs" and the dashboard receive
 # every line.
-run-pipeline3 "$@" 2>&1 | tee -a "$LOGFILE"
+run-pipeline3 pipeline.py "$@" 2>&1 | tee -a "$LOGFILE"

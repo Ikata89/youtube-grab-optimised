@@ -78,14 +78,9 @@ _ITEM_RE = re.compile(r'\b(v\d*:[0-9a-zA-Z_\-]{6,12})\b')
 # (leading byte count + percentage required — uniquely identifies rsync output)
 _RSYNC_SPEED_RE = re.compile(r'[\d,]+\s+\d+%\s+([\d.]+\s*[KMGkm]i?B/s)', re.I)
 
-# wget / other download speed patterns (no leading byte count):
-#   "(1.23 MB/s)"  — wget verbose transfer complete line
-#   "17%  200KB/s" — wget-at progress without byte prefix
-_DL_SPEED_RE = re.compile(
-    r'\(([\d.]+\s*[KMGkm]i?B/s)\)'        # wget: (1.23 MB/s)
-    r'|\b\d+%\s+([\d.]+\s*[KMGkm]i?B/s)', # wget-at progress: 17%  200KB/s
-    re.I
-)
+# Download speed — any speed token not already caught by _RSYNC_SPEED_RE.
+# Covers wget verbose "(1.23 MB/s)" and bare "200KB/s" style output.
+_DL_SPEED_RE = re.compile(r'([\d.]+\s*[KMGkm]i?B/s)', re.I)
 
 # Completion signals (broaden if your seesaw version logs differently):
 #   "Item v:ID done."          — seesaw pipeline runner standard log
@@ -185,16 +180,17 @@ def parse_line(raw: str):
             changed = True
 
         # ── Speed ─────────────────────────────────────────────────────────────
-        # rsync lines (have leading byte count): always upload speed
+        # rsync progress lines have a leading byte count before the percentage
+        # and are always the upload phase.  Anything else with a speed token
+        # gets attributed by stage: upload stages → upload, otherwise → download.
         rm = _RSYNC_SPEED_RE.search(line)
         if rm:
             state['upload_speed'] = rm.group(1)
             changed = True
         else:
-            # wget / other speed lines: upload if item is past WgetDownload, else download
             dm = _DL_SPEED_RE.search(line)
             if dm:
-                speed = dm.group(1) or dm.group(2)
+                speed = dm.group(1)
                 in_upload = cur and cur['stage_idx'] >= _UPLOAD_STAGE_IDX
                 if in_upload:
                     state['upload_speed'] = speed
@@ -317,10 +313,6 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .log-msg.hl-bl {color:var(--blue)}
 .log-msg.hl-yl {color:var(--yellow)}
 
-/* filter: hide non-matching lines when .filtered is on #log */
-#log.filtered .log-line{display:none}
-#log.filtered .log-line.sel{display:flex}
-
 /* scrollbar */
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:transparent}
@@ -394,41 +386,38 @@ function logCls(line){
 // ── Filter state ──────────────────────────────────────────────────────────────
 let selectedKey = null;   // lower-case item key, or null for no filter
 
-function setFilter(key) {
-  // clicking the same card again deselects
-  selectedKey = (key === selectedKey) ? null : key;
-
-  const logEl   = document.getElementById('log');
-  const badge   = document.getElementById('filter-badge');
-  const lblEl   = document.getElementById('filter-label');
-
-  if (selectedKey) {
-    logEl.classList.add('filtered');
-    lblEl.textContent = selectedKey;
-    badge.style.display = '';
-    // mark matching existing lines
-    logEl.querySelectorAll('.log-line').forEach(el => {
-      el.classList.toggle('sel', el.dataset.item === selectedKey);
-    });
-  } else {
-    logEl.classList.remove('filtered');
-    badge.style.display = 'none';
+// Apply current filter to every log line via direct style (no CSS class games).
+function applyFilter() {
+  const kids = logEl.children;
+  for (let i = 0; i < kids.length; i++) {
+    const el = kids[i];
+    el.style.display = (!selectedKey || el.dataset.item === selectedKey) ? '' : 'none';
   }
+}
 
-  // highlight selected card
-  document.querySelectorAll('.item-card').forEach(card => {
-    card.classList.toggle('card-selected', card.dataset.key === selectedKey);
+function setFilter(key) {
+  selectedKey = (key === selectedKey) ? null : key;  // toggle on re-click
+
+  applyFilter();
+
+  const badge = document.getElementById('filter-badge');
+  const lbl   = document.getElementById('filter-label');
+  badge.style.display = selectedKey ? '' : 'none';
+  if (selectedKey) lbl.textContent = selectedKey;
+
+  document.querySelectorAll('.item-card').forEach(c => {
+    c.classList.toggle('card-selected', c.dataset.key === selectedKey);
   });
 }
 
-// click on items panel → filter; click elsewhere → deselect
-document.getElementById('items').addEventListener('click', e => {
+// Delegate clicks on the items panel — card or empty space both handled.
+itemEl.addEventListener('click', e => {
   const card = e.target.closest('.item-card[data-key]');
+  // Clicking empty space in items panel clears filter.
   setFilter(card ? card.dataset.key : null);
 });
-document.getElementById('log').addEventListener('click', () => {
-  if (selectedKey) setFilter(null);
-});
+// Clicking the log panel clears the filter.
+logEl.addEventListener('click', () => { if (selectedKey) setFilter(null); });
 
 // ── Log helpers ───────────────────────────────────────────────────────────────
 function itemTagHtml(entry) {
@@ -453,12 +442,12 @@ function appendLog(entry) {
   const div = document.createElement('div');
   div.className = 'log-line';
   div.dataset.item = entry.item || '';
-  if (!selectedKey || entry.item === selectedKey) div.classList.add('sel');
+  const visible = !selectedKey || entry.item === selectedKey;
+  if (!visible) div.style.display = 'none';
   div.innerHTML = logLineHtml(entry);
   logEl.appendChild(div);
   while (logEl.children.length > 400) logEl.removeChild(logEl.firstChild);
-  const lineVisible = !selectedKey || entry.item === selectedKey;
-  if (atBottom && lineVisible) logEl.scrollTop = logEl.scrollHeight;
+  if (atBottom && visible) logEl.scrollTop = logEl.scrollHeight;
 }
 
 // ── Item card renderer ────────────────────────────────────────────────────────
@@ -505,8 +494,8 @@ function renderFull(s) {
   if (s.logs) {
     const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 30;
     logEl.innerHTML = s.logs.map(e => {
-      const match = !selectedKey || e.item === selectedKey;
-      return `<div class="log-line${match ? ' sel' : ''}" data-item="${esc(e.item||'')}">`
+      const show = !selectedKey || e.item === selectedKey;
+      return `<div class="log-line" data-item="${esc(e.item||'')}"${show ? '' : ' style="display:none"'}>`
         + logLineHtml(e) + '</div>';
     }).join('');
     if (atBottom) logEl.scrollTop = logEl.scrollHeight;

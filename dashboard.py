@@ -24,24 +24,25 @@ STAGES = [
 ]
 STAGE_IDX = {s: i for i, s in enumerate(STAGES)}
 
+# Stages at which a speed line belongs to the upload path rather than download
+_UPLOAD_STAGE_IDX = STAGE_IDX['PrepareStatsForTracker']
+
 # ── Shared state ───────────────────────────────────────────────────────────────
-# Each item dict:
-#   name, stage, stage_idx, substage, started, status ('active'|'done'|'failed'), ci (color index)
-# Each log entry:
-#   t (timestamp), l (line text), item (item name or None), ci (color index or None)
+# items keyed by item_name.lower() so SetBadUrls' lowercase logs resolve correctly.
+# item dict: name (original case), stage, stage_idx, substage, started, status, ci
+# log entry: t, l, item (lower-case key or None), ci
 state = {
-    'items'      : OrderedDict(),
-    'completed'  : 0,
-    'failed'     : 0,
+    'items'       : OrderedDict(),
+    'completed'   : 0,
+    'failed'      : 0,
     'upload_speed': None,
-    'dl_speed'   : None,
-    'logs'       : deque(maxlen=400),
-    'started_at' : time.time(),
-    '_cur_item'  : None,   # most recently referenced item name
-    '_color_ctr' : 0,      # incremented per new item for palette assignment
+    'dl_speed'    : None,
+    'logs'        : deque(maxlen=400),
+    'started_at'  : time.time(),
+    '_cur_key'    : None,   # lower-case key of most recently seen item
+    '_color_ctr'  : 0,
 }
 lock = threading.Lock()
-
 sse_clients = []
 sse_lock = threading.Lock()
 
@@ -69,16 +70,38 @@ def broadcast(data):
 # ── Log parser ─────────────────────────────────────────────────────────────────
 
 _DOCKER_TS = re.compile(r'^\d{4}-\d{2}-\d{2}T[\d:.]+Z ')
-_ITEM_RE   = re.compile(r'\b(v\d*:[0-9a-zA-Z_\-]{6,12})\b')
-# rsync upload speed:  "1,234,567  45%   5.12MB/s"
-_UP_RE     = re.compile(r'[\d,]+\s+\d+%\s+([\d.]+\s*[KMGkm]?B/s)')
-# wget download speed: "(1.23 MB/s)" at end of transfer line
-_DL_RE     = re.compile(r'\(([\d.]+\s*[KMGi]+B/s)\)')
-# Completion: SendDoneToTracker sends a POST and logs the response.
-# "Sending done to tracker" is the most common pattern; broaden if needed.
-_DONE_RE   = re.compile(r'Sending done.*?tracker', re.I)
-# Failure: SetBadUrls logs "Item X is aborted."
-_FAIL_RE   = re.compile(r'\bis aborted\b|failed to download', re.I)
+
+# Item names: v:ID or v1:ID / v2:ID — match case-insensitively
+_ITEM_RE = re.compile(r'\b(v\d*:[0-9a-zA-Z_\-]{6,12})\b')
+
+# rsync progress:  "1,234,567  45%   5.12MB/s   0:00:01"
+# (leading byte count + percentage required — uniquely identifies rsync output)
+_RSYNC_SPEED_RE = re.compile(r'[\d,]+\s+\d+%\s+([\d.]+\s*[KMGkm]i?B/s)', re.I)
+
+# wget / other download speed patterns (no leading byte count):
+#   "(1.23 MB/s)"  — wget verbose transfer complete line
+#   "17%  200KB/s" — wget-at progress without byte prefix
+_DL_SPEED_RE = re.compile(
+    r'\(([\d.]+\s*[KMGkm]i?B/s)\)'        # wget: (1.23 MB/s)
+    r'|\b\d+%\s+([\d.]+\s*[KMGkm]i?B/s)', # wget-at progress: 17%  200KB/s
+    re.I
+)
+
+# Completion signals (broaden if your seesaw version logs differently):
+#   "Item v:ID done."          — seesaw pipeline runner standard log
+#   "Sending done to tracker"  — SendDoneToTracker pre-request log
+#   "item done"                — shorter seesaw variant
+_DONE_RE = re.compile(
+    r'Item\s+\S+\s+done\b'
+    r'|\bitem\s+done\b'
+    r'|Sending done.*?tracker',
+    re.I
+)
+
+# Failure signals:
+#   "Item v:abc123 is aborted." — SetBadUrls (note: logs item in lower-case)
+#   "Download failed"           — WgetDownload on bad exit code
+_FAIL_RE = re.compile(r'\bis aborted\b|Download failed', re.I)
 
 
 def _detect_substage(line):
@@ -112,16 +135,18 @@ def parse_line(raw: str):
     log_entry = None
 
     with lock:
-        # ── Item name detection → updates _cur_item ─────────────────────────
+        # ── Item detection ────────────────────────────────────────────────────
+        # Use lower-case key so SetBadUrls' lowercase logs match the stored entry.
         m = _ITEM_RE.search(line)
-        item_name = m.group(1) if m else None
-
-        if item_name:
-            if item_name not in state['items']:
+        if m:
+            raw_name = m.group(1)
+            key = raw_name.lower()
+            if key not in state['items']:
                 ci = state['_color_ctr']
                 state['_color_ctr'] += 1
-                state['items'][item_name] = {
-                    'name'     : item_name,
+                state['items'][key] = {
+                    'name'     : raw_name,   # original case for display
+                    'key'      : key,
                     'stage'    : '',
                     'stage_idx': -1,
                     'substage' : '',
@@ -130,19 +155,20 @@ def parse_line(raw: str):
                     'ci'       : ci,
                 }
                 changed = True
-            state['_cur_item'] = item_name
+            state['_cur_key'] = key
 
-        cur = state['items'].get(state['_cur_item']) if state['_cur_item'] else None
+        cur = state['items'].get(state['_cur_key']) if state['_cur_key'] else None
 
         log_entry = {
             't'   : now,
             'l'   : line,
-            'item': state['_cur_item'],
+            'item': state['_cur_key'],          # lower-case key for JS matching
+            'name': cur['name'] if cur else None,  # display name
             'ci'  : cur['ci'] if cur else None,
         }
         state['logs'].append(log_entry)
 
-        # ── Pipeline stage → update current item only ────────────────────────
+        # ── Pipeline stage → current item only ───────────────────────────────
         for stage in STAGES:
             if re.search(r'\b' + re.escape(stage) + r'\b', line):
                 idx = STAGE_IDX[stage]
@@ -154,26 +180,31 @@ def parse_line(raw: str):
 
         # ── Substage ─────────────────────────────────────────────────────────
         sub = _detect_substage(line)
-        if sub and cur and cur['status'] == 'active':
-            if cur['substage'] != sub:
-                cur['substage'] = sub
+        if sub and cur and cur['status'] == 'active' and cur['substage'] != sub:
+            cur['substage'] = sub
+            changed = True
+
+        # ── Speed ─────────────────────────────────────────────────────────────
+        # rsync lines (have leading byte count): always upload speed
+        rm = _RSYNC_SPEED_RE.search(line)
+        if rm:
+            state['upload_speed'] = rm.group(1)
+            changed = True
+        else:
+            # wget / other speed lines: upload if item is past WgetDownload, else download
+            dm = _DL_SPEED_RE.search(line)
+            if dm:
+                speed = dm.group(1) or dm.group(2)
+                in_upload = cur and cur['stage_idx'] >= _UPLOAD_STAGE_IDX
+                if in_upload:
+                    state['upload_speed'] = speed
+                else:
+                    state['dl_speed'] = speed
                 changed = True
 
-        # ── Upload speed (rsync) ─────────────────────────────────────────────
-        sm = _UP_RE.search(line)
-        if sm:
-            state['upload_speed'] = sm.group(1)
-            changed = True
-
-        # ── Download speed (wget verbose) ────────────────────────────────────
-        dm = _DL_RE.search(line)
-        if dm:
-            state['dl_speed'] = dm.group(1)
-            changed = True
-
-        # ── Completion ───────────────────────────────────────────────────────
-        # Use _cur_item if it's active, otherwise fall back to oldest active.
-        # "Skipping SendDoneToTracker" is NOT counted — that's an abort path.
+        # ── Completion ────────────────────────────────────────────────────────
+        # "Skipping SendDoneToTracker" is intentionally excluded — that's the
+        # abort path; the failure is already counted by _FAIL_RE via SetBadUrls.
         if _DONE_RE.search(line):
             target = (cur if cur and cur['status'] == 'active' else None) \
                      or _oldest_active()
@@ -192,8 +223,6 @@ def parse_line(raw: str):
                 state['failed'] += 1
                 changed = True
 
-    # Broadcast the log line immediately (cheap delta).
-    # Broadcast a state snapshot only when something structural changed.
     broadcast({'log': log_entry})
     if changed:
         broadcast({'state': _snapshot()})
@@ -201,8 +230,11 @@ def parse_line(raw: str):
 
 def _snapshot(include_logs=False):
     with lock:
+        # Only expose active items (max 6) — done/failed items are tracked
+        # internally for colour assignment and log tagging but not shown.
+        active = [v for v in state['items'].values() if v['status'] == 'active']
         s = {
-            'items'       : list(state['items'].values())[-20:],
+            'items'       : active[-6:],
             'completed'   : state['completed'],
             'failed'      : state['failed'],
             'upload_speed': state['upload_speed'],
@@ -239,7 +271,7 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .stat{display:flex;flex-direction:column;gap:1px}
 .stat-lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
 .stat-val{font-size:22px;font-weight:700;line-height:1}
-.green{color:var(--green)}.red{color:var(--red)}.blue{color:var(--blue)}.orange{color:var(--orange)}
+.c-green{color:var(--green)}.c-red{color:var(--red)}.c-blue{color:var(--blue)}.c-orange{color:var(--orange)}
 .hdr-spacer{flex:1}
 .uptime{font-size:11px;color:var(--muted)}
 
@@ -248,30 +280,28 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 
 /* ── Panel ── */
 .panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;display:flex;flex-direction:column;overflow:hidden}
-.panel-hdr{padding:8px 14px;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;flex-shrink:0}
+.panel-hdr{padding:8px 14px;border-bottom:1px solid var(--border);font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;flex-shrink:0;display:flex;align-items:center;gap:8px}
 .panel-body{flex:1;overflow-y:auto;padding:10px}
 
+/* filter badge in log panel header */
+.filter-badge{background:rgba(88,166,255,.15);color:var(--blue);border-radius:4px;padding:1px 6px;font-size:10px;display:flex;align-items:center;gap:4px}
+.filter-badge button{background:none;border:none;color:var(--blue);cursor:pointer;font-size:11px;line-height:1;padding:0}
+
 /* ── Item cards ── */
-.item-card{background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:10px 13px;margin-bottom:8px;border-left-width:3px;transition:opacity .3s}
-.item-card.done{opacity:.55}
-.item-card.failed{opacity:.7}
+.item-card{background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:10px 13px;margin-bottom:8px;border-left-width:3px;cursor:pointer;transition:opacity .2s,box-shadow .2s}
+.item-card:hover{box-shadow:0 0 0 1px rgba(255,255,255,.08)}
+.item-card.card-selected{box-shadow:0 0 0 2px var(--blue)}
 .item-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:7px}
 .item-name{font-family:'SF Mono',Consolas,monospace;font-size:13px;font-weight:700}
-
 .badge{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
 .badge-active{background:rgba(88,166,255,.15);color:var(--blue)}
-.badge-done  {background:rgba(63,185,80,.15);color:var(--green)}
-.badge-failed{background:rgba(248,81,73,.15);color:var(--red)}
 
 /* stage dot-track */
 .item-track{display:flex;align-items:center;gap:3px;margin-bottom:5px}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--border);flex-shrink:0;cursor:default;transition:background .2s}
 .dot.past{background:var(--green);opacity:.7}
-.dot.cur {background:var(--blue);box-shadow:0 0 5px var(--blue);width:11px;height:11px}
+.dot.cur{background:var(--blue);box-shadow:0 0 5px var(--blue);width:11px;height:11px}
 .track-label{font-size:11px;color:var(--blue);font-weight:600;margin-left:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.track-label.done-lbl{color:var(--green)}
-.track-label.fail-lbl{color:var(--red)}
-
 .item-sub{font-size:11px;color:var(--purple);margin-bottom:3px}
 .item-foot{font-size:10px;color:var(--muted)}
 .empty{color:var(--muted);text-align:center;padding:32px 16px;font-size:12px}
@@ -287,6 +317,10 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .log-msg.hl-bl {color:var(--blue)}
 .log-msg.hl-yl {color:var(--yellow)}
 
+/* filter: hide non-matching lines when .filtered is on #log */
+#log.filtered .log-line{display:none}
+#log.filtered .log-line.sel{display:flex}
+
 /* scrollbar */
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:transparent}
@@ -299,19 +333,19 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
   <div class="hdr-title"><span class="live-dot"></span>youtube-grab</div>
   <div class="stat">
     <span class="stat-lbl">Completed</span>
-    <span class="stat-val green" id="n-done">0</span>
+    <span class="stat-val c-green" id="n-done">0</span>
   </div>
   <div class="stat">
     <span class="stat-lbl">Failed</span>
-    <span class="stat-val red" id="n-fail">0</span>
+    <span class="stat-val c-red" id="n-fail">0</span>
   </div>
   <div class="stat">
     <span class="stat-lbl">Download</span>
-    <span class="stat-val blue" id="dl-speed">—</span>
+    <span class="stat-val c-blue" id="dl-speed">—</span>
   </div>
   <div class="stat">
     <span class="stat-lbl">Upload</span>
-    <span class="stat-val orange" id="ul-speed">—</span>
+    <span class="stat-val c-orange" id="ul-speed">—</span>
   </div>
   <div class="hdr-spacer"></div>
   <span class="uptime" id="uptime"></span>
@@ -319,17 +353,22 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 
 <div class="body">
   <div class="panel">
-    <div class="panel-hdr">Items</div>
+    <div class="panel-hdr">Active Items</div>
     <div class="panel-body" id="items"><div class="empty">Waiting for items…</div></div>
   </div>
   <div class="panel">
-    <div class="panel-hdr">Live log</div>
+    <div class="panel-hdr">
+      <span>Live log</span>
+      <span class="filter-badge" id="filter-badge" style="display:none">
+        <span id="filter-label"></span>
+        <button title="Clear filter" onclick="setFilter(null)">✕</button>
+      </span>
+    </div>
     <div class="panel-body" id="log"></div>
   </div>
 </div>
 
 <script>
-// 8-colour palette, one per item (cycles)
 const PALETTE = [
   '#58a6ff','#3fb950','#e3b341','#bc8cff',
   '#f78166','#79c0ff','#56d364','#ffa657'
@@ -343,8 +382,6 @@ function fmtUptime(s){
   const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;
   return h?`${h}h ${m}m`:(m?`${m}m ${ss}s`:`${ss}s`);
 }
-
-// Colour-code log lines by content
 function logCls(line){
   if(/getting (more )?comments|getting replies|Decrypted|player js/i.test(line)) return 'hl-bl';
   if(/not playable|aborted|error|failed/i.test(line))  return 'hl-rd';
@@ -354,109 +391,135 @@ function logCls(line){
   return '';
 }
 
-// Build a coloured [ITEMID] tag for a log entry
-function itemTagHtml(entry){
-  if(entry.ci == null) return '';
-  const color = itemColor(entry.ci);
-  const short = (entry.item||'').replace(/^v\d*:/,'').substring(0,8);
-  const bg = color + '22';  // 13% opacity hex alpha
-  return `<span class="item-tag" style="color:${color};background:${bg}">${esc(short)}</span>`;
+// ── Filter state ──────────────────────────────────────────────────────────────
+let selectedKey = null;   // lower-case item key, or null for no filter
+
+function setFilter(key) {
+  // clicking the same card again deselects
+  selectedKey = (key === selectedKey) ? null : key;
+
+  const logEl   = document.getElementById('log');
+  const badge   = document.getElementById('filter-badge');
+  const lblEl   = document.getElementById('filter-label');
+
+  if (selectedKey) {
+    logEl.classList.add('filtered');
+    lblEl.textContent = selectedKey;
+    badge.style.display = '';
+    // mark matching existing lines
+    logEl.querySelectorAll('.log-line').forEach(el => {
+      el.classList.toggle('sel', el.dataset.item === selectedKey);
+    });
+  } else {
+    logEl.classList.remove('filtered');
+    badge.style.display = 'none';
+  }
+
+  // highlight selected card
+  document.querySelectorAll('.item-card').forEach(card => {
+    card.classList.toggle('card-selected', card.dataset.key === selectedKey);
+  });
 }
 
-// Build item card HTML
-function itemCardHtml(it, stages){
-  const color     = itemColor(it.ci) || '#58a6ff';
-  const stageIdx  = it.stage_idx;
-  const statusCls = it.status;
+// click on items panel → filter; click elsewhere → deselect
+document.getElementById('items').addEventListener('click', e => {
+  const card = e.target.closest('.item-card[data-key]');
+  setFilter(card ? card.dataset.key : null);
+});
+document.getElementById('log').addEventListener('click', () => {
+  if (selectedKey) setFilter(null);
+});
 
-  const dots = stages.map((s,i) => {
-    const cls = i < stageIdx ? 'past' : i === stageIdx ? 'cur' : '';
-    return `<span class="dot ${cls}" title="${esc(s)}"></span>`;
-  }).join('');
+// ── Log helpers ───────────────────────────────────────────────────────────────
+function itemTagHtml(entry) {
+  if (entry.ci == null || !entry.item) return '';
+  const color = itemColor(entry.ci);
+  const short = entry.item.replace(/^v\d*:/,'').substring(0, 8);
+  return `<span class="item-tag" style="color:${color};background:${color}22">${esc(short)}</span>`;
+}
 
-  let labelCls = '', labelTxt = esc(it.stage || '—');
-  if(it.status === 'done')   { labelCls = 'done-lbl'; labelTxt = '✓ done'; }
-  if(it.status === 'failed') { labelCls = 'fail-lbl'; labelTxt = '✗ failed'; }
-
-  const bc = `badge-${it.status}`;
-
-  return `<div class="item-card ${statusCls}" style="border-left-color:${color}">
-    <div class="item-top">
-      <span class="item-name" style="color:${color}">${esc(it.name)}</span>
-      <span class="badge ${bc}">${esc(it.status)}</span>
-    </div>
-    <div class="item-track">
-      ${dots}
-      <span class="track-label ${labelCls}">${labelTxt}</span>
-    </div>
-    ${it.substage ? `<div class="item-sub">↳ ${esc(it.substage)}</div>` : ''}
-    <div class="item-foot">started ${esc(it.started)}</div>
-  </div>`;
+function logLineHtml(entry) {
+  return `<span class="log-ts">${esc(entry.t)}</span>`
+    + itemTagHtml(entry)
+    + `<span class="log-msg ${logCls(entry.l)}">${esc(entry.l)}</span>`;
 }
 
 const logEl  = document.getElementById('log');
 const itemEl = document.getElementById('items');
 let   _stages = [];
 
-function appendLog(entry){
+function appendLog(entry) {
   const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 30;
   const div = document.createElement('div');
   div.className = 'log-line';
-  div.innerHTML =
-    `<span class="log-ts">${esc(entry.t)}</span>`
-    + itemTagHtml(entry)
-    + `<span class="log-msg ${logCls(entry.l)}">${esc(entry.l)}</span>`;
+  div.dataset.item = entry.item || '';
+  if (!selectedKey || entry.item === selectedKey) div.classList.add('sel');
+  div.innerHTML = logLineHtml(entry);
   logEl.appendChild(div);
-  while(logEl.children.length > 400) logEl.removeChild(logEl.firstChild);
-  if(atBottom) logEl.scrollTop = logEl.scrollHeight;
+  while (logEl.children.length > 400) logEl.removeChild(logEl.firstChild);
+  const lineVisible = !selectedKey || entry.item === selectedKey;
+  if (atBottom && lineVisible) logEl.scrollTop = logEl.scrollHeight;
 }
 
-function updateStats(state){
-  document.getElementById('n-done').textContent  = state.completed;
-  document.getElementById('n-fail').textContent  = state.failed;
-  document.getElementById('dl-speed').textContent = state.dl_speed    || '—';
-  document.getElementById('ul-speed').textContent = state.upload_speed || '—';
-  document.getElementById('uptime').textContent   = 'up ' + fmtUptime(state.uptime);
+// ── Item card renderer ────────────────────────────────────────────────────────
+function itemCardHtml(it) {
+  const color = itemColor(it.ci) || '#58a6ff';
+  const dots  = (_stages||[]).map((s, i) => {
+    const cls = i < it.stage_idx ? 'past' : i === it.stage_idx ? 'cur' : '';
+    return `<span class="dot ${cls}" title="${esc(s)}"></span>`;
+  }).join('');
+  const stageLbl = esc(it.stage || '—');
+  return `<div class="item-card${it.key === selectedKey ? ' card-selected' : ''}"
+               data-key="${esc(it.key)}"
+               style="border-left-color:${color}">
+    <div class="item-top">
+      <span class="item-name" style="color:${color}">${esc(it.name)}</span>
+      <span class="badge badge-active">active</span>
+    </div>
+    <div class="item-track">${dots}<span class="track-label">${stageLbl}</span></div>
+    ${it.substage ? `<div class="item-sub">↳ ${esc(it.substage)}</div>` : ''}
+    <div class="item-foot">started ${esc(it.started)}</div>
+  </div>`;
 }
 
-function updateItems(state){
-  _stages = state.stages || _stages;
-  const items = (state.items || []).slice().reverse();
-  if(!items.length){
-    itemEl.innerHTML = '<div class="empty">Waiting for items…</div>';
-  } else {
-    itemEl.innerHTML = items.map(it => itemCardHtml(it, _stages)).join('');
-  }
+// ── State rendering ───────────────────────────────────────────────────────────
+function updateStats(s) {
+  document.getElementById('n-done').textContent   = s.completed;
+  document.getElementById('n-fail').textContent   = s.failed;
+  document.getElementById('dl-speed').textContent = s.dl_speed     || '—';
+  document.getElementById('ul-speed').textContent = s.upload_speed || '—';
+  document.getElementById('uptime').textContent   = 'up ' + fmtUptime(s.uptime);
 }
 
-function renderFull(state){
-  updateStats(state);
-  updateItems(state);
-  if(state.logs){
+function updateItems(s) {
+  _stages = s.stages || _stages;
+  const items = (s.items || []).slice().reverse();
+  itemEl.innerHTML = items.length
+    ? items.map(itemCardHtml).join('')
+    : '<div class="empty">Waiting for items…</div>';
+}
+
+function renderFull(s) {
+  updateStats(s);
+  updateItems(s);
+  if (s.logs) {
     const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 30;
-    logEl.innerHTML = state.logs.map(e =>
-      `<div class="log-line">`
-      + `<span class="log-ts">${esc(e.t)}</span>`
-      + itemTagHtml(e)
-      + `<span class="log-msg ${logCls(e.l)}">${esc(e.l)}</span>`
-      + `</div>`
-    ).join('');
-    if(atBottom) logEl.scrollTop = logEl.scrollHeight;
+    logEl.innerHTML = s.logs.map(e => {
+      const match = !selectedKey || e.item === selectedKey;
+      return `<div class="log-line${match ? ' sel' : ''}" data-item="${esc(e.item||'')}">`
+        + logLineHtml(e) + '</div>';
+    }).join('');
+    if (atBottom) logEl.scrollTop = logEl.scrollHeight;
   }
 }
 
-// SSE with auto-reconnect
-function connect(){
+// ── SSE with auto-reconnect ───────────────────────────────────────────────────
+function connect() {
   const es = new EventSource('/events');
   es.onmessage = e => {
     const msg = JSON.parse(e.data);
-    if(msg.state){
-      // Full state snapshot (includes logs on first connect)
-      renderFull(msg.state);
-    } else if(msg.log){
-      // Incremental log line — update log pane only
-      appendLog(msg.log);
-    }
+    if (msg.state) renderFull(msg.state);
+    else if (msg.log) appendLog(msg.log);
   };
   es.onerror = () => { es.close(); setTimeout(connect, 2000); };
 }
@@ -510,7 +573,6 @@ class Handler(BaseHTTPRequestHandler):
             sse_clients.append(q)
 
         try:
-            # Full state + log replay on connect
             init = 'data: ' + json.dumps({'state': _snapshot(include_logs=True)}) + '\n\n'
             self.wfile.write(init.encode())
             self.wfile.flush()
